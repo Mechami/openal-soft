@@ -365,11 +365,11 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(ui->closeCancelButton, &QPushButton::clicked, this, &MainWindow::cancelCloseAction);
     connect(ui->applyButton, &QPushButton::clicked, this, &MainWindow::saveCurrentConfig);
 
-    auto qcb_cicstr = static_cast<void(QComboBox::*)(const QString&)>(&QComboBox::currentIndexChanged);
-    connect(ui->channelConfigCombo, qcb_cicstr, this, &MainWindow::enableApplyButton);
-    connect(ui->sampleFormatCombo, qcb_cicstr, this, &MainWindow::enableApplyButton);
-    connect(ui->stereoModeCombo, qcb_cicstr, this, &MainWindow::enableApplyButton);
-    connect(ui->sampleRateCombo, qcb_cicstr, this, &MainWindow::enableApplyButton);
+    auto qcb_cicint = static_cast<void(QComboBox::*)(int)>(&QComboBox::currentIndexChanged);
+    connect(ui->channelConfigCombo, qcb_cicint, this, &MainWindow::enableApplyButton);
+    connect(ui->sampleFormatCombo, qcb_cicint, this, &MainWindow::enableApplyButton);
+    connect(ui->stereoModeCombo, qcb_cicint, this, &MainWindow::enableApplyButton);
+    connect(ui->sampleRateCombo, qcb_cicint, this, &MainWindow::enableApplyButton);
     connect(ui->sampleRateCombo, &QComboBox::editTextChanged, this, &MainWindow::enableApplyButton);
 
     connect(ui->resamplerSlider, &QSlider::valueChanged, this, &MainWindow::updateResamplerLabel);
@@ -379,8 +379,8 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(ui->periodCountSlider, &QSlider::valueChanged, this, &MainWindow::updatePeriodCountEdit);
     connect(ui->periodCountEdit, &QLineEdit::editingFinished, this, &MainWindow::updatePeriodCountSlider);
 
-    connect(ui->stereoEncodingComboBox, qcb_cicstr, this, &MainWindow::enableApplyButton);
-    connect(ui->ambiFormatComboBox, qcb_cicstr, this, &MainWindow::enableApplyButton);
+    connect(ui->stereoEncodingComboBox, qcb_cicint, this, &MainWindow::enableApplyButton);
+    connect(ui->ambiFormatComboBox, qcb_cicint, this, &MainWindow::enableApplyButton);
     connect(ui->outputLimiterCheckBox, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
     connect(ui->outputDitherCheckBox, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
 
@@ -398,8 +398,8 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(ui->decoder71LineEdit, &QLineEdit::textChanged, this, &MainWindow::enableApplyButton);
     connect(ui->decoder71Button, &QPushButton::clicked, this, &MainWindow::select71DecoderFile);
 
-    connect(ui->preferredHrtfComboBox, qcb_cicstr, this, &MainWindow::enableApplyButton);
-    connect(ui->hrtfStateComboBox, qcb_cicstr, this, &MainWindow::enableApplyButton);
+    connect(ui->preferredHrtfComboBox, qcb_cicint, this, &MainWindow::enableApplyButton);
+    connect(ui->hrtfStateComboBox, qcb_cicint, this, &MainWindow::enableApplyButton);
     connect(ui->hrtfmodeSlider, &QSlider::valueChanged, this, &MainWindow::updateHrtfModeLabel);
 
     connect(ui->hrtfAddButton, &QPushButton::clicked, this, &MainWindow::addHrtfFile);
@@ -424,7 +424,7 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(ui->disabledBackendList, &QListWidget::customContextMenuRequested, this, &MainWindow::showDisabledBackendMenu);
     connect(ui->backendCheckBox, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
 
-    connect(ui->defaultReverbComboBox, qcb_cicstr, this, &MainWindow::enableApplyButton);
+    connect(ui->defaultReverbComboBox, qcb_cicint, this, &MainWindow::enableApplyButton);
     connect(ui->enableEaxReverbCheck, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
     connect(ui->enableStdReverbCheck, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
     connect(ui->enableAutowahCheck, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
@@ -446,6 +446,7 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(ui->pulseAdjLatencyCheckBox, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
 
     connect(ui->jackAutospawnCheckBox, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
+    connect(ui->jackConnectPortsCheckBox, &QCheckBox::stateChanged, this, &MainWindow::enableApplyButton);
     connect(ui->jackBufferSizeSlider, &QSlider::valueChanged, this, &MainWindow::updateJackBufferSizeEdit);
     connect(ui->jackBufferSizeLine, &QLineEdit::editingFinished, this, &MainWindow::updateJackBufferSizeSlider);
 
@@ -474,10 +475,9 @@ MainWindow::MainWindow(QWidget *parent) :
     for(int i = 0;backendList[i].backend_name[0];i++)
     {
         QList<QListWidgetItem*> items = ui->backendListWidget->findItems(
-            backendList[i].full_string, Qt::MatchFixedString
-        );
-        foreach(const QListWidgetItem *item, items)
-            ui->backendListWidget->setItemHidden(item, false);
+            backendList[i].full_string, Qt::MatchFixedString);
+        foreach(QListWidgetItem *item, items)
+            item->setHidden(false);
     }
 
     loadConfig(getDefaultConfigName());
@@ -918,6 +918,7 @@ void MainWindow::loadConfig(const QString &fname)
     ui->pulseAdjLatencyCheckBox->setCheckState(getCheckState(settings.value("pulse/adjust-latency")));
 
     ui->jackAutospawnCheckBox->setCheckState(getCheckState(settings.value("jack/spawn-server")));
+    ui->jackConnectPortsCheckBox->setCheckState(getCheckState(settings.value("jack/connect-ports")));
     ui->jackBufferSizeLine->setText(settings.value("jack/buffer-size", QString()).toString());
     updateJackBufferSizeSlider();
 
@@ -1127,6 +1128,7 @@ void MainWindow::saveConfig(const QString &fname) const
     settings.setValue("pulse/adjust-latency", getCheckValue(ui->pulseAdjLatencyCheckBox));
 
     settings.setValue("jack/spawn-server", getCheckValue(ui->jackAutospawnCheckBox));
+    settings.setValue("jack/connect-ports", getCheckValue(ui->jackConnectPortsCheckBox));
     settings.setValue("jack/buffer-size", ui->jackBufferSizeLine->text());
 
     settings.setValue("alsa/device", ui->alsaDefaultDeviceLine->text());

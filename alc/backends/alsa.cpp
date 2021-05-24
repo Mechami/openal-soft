@@ -20,7 +20,7 @@
 
 #include "config.h"
 
-#include "backends/alsa.h"
+#include "alsa.h"
 
 #include <algorithm>
 #include <atomic>
@@ -35,18 +35,15 @@
 #include <thread>
 #include <utility>
 
-#include "AL/al.h"
-
 #include "albyte.h"
-#include "alcmain.h"
-#include "alconfig.h"
-#include "alexcpt.h"
+#include "alc/alconfig.h"
 #include "almalloc.h"
 #include "alnumeric.h"
 #include "aloptional.h"
-#include "alu.h"
+#include "core/device.h"
+#include "core/helpers.h"
+#include "core/logging.h"
 #include "dynload.h"
-#include "logging.h"
 #include "ringbuffer.h"
 #include "threads.h"
 #include "vector.h"
@@ -56,7 +53,7 @@
 
 namespace {
 
-constexpr ALCchar alsaDevice[] = "ALSA Default";
+constexpr char alsaDevice[] = "ALSA Default";
 
 
 #ifdef HAVE_DYNLOAD
@@ -325,7 +322,7 @@ al::vector<DevMap> probe_devices(snd_pcm_stream_t stream)
                 ERR("snd_ctl_pcm_next_device failed\n");
             if(dev < 0) break;
 
-            snd_pcm_info_set_device(pcminfo, static_cast<ALuint>(dev));
+            snd_pcm_info_set_device(pcminfo, static_cast<uint>(dev));
             snd_pcm_info_set_subdevice(pcminfo, 0);
             snd_pcm_info_set_stream(pcminfo, stream);
             if((err=snd_ctl_pcm_info(handle, pcminfo)) < 0)
@@ -410,20 +407,22 @@ int verify_state(snd_pcm_t *handle)
 
 
 struct AlsaPlayback final : public BackendBase {
-    AlsaPlayback(ALCdevice *device) noexcept : BackendBase{device} { }
+    AlsaPlayback(DeviceBase *device) noexcept : BackendBase{device} { }
     ~AlsaPlayback() override;
 
     int mixerProc();
     int mixerNoMMapProc();
 
-    void open(const ALCchar *name) override;
+    void open(const char *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     ClockLatency getClockLatency() override;
 
     snd_pcm_t *mPcmHandle{nullptr};
+
+    std::mutex mMutex;
 
     al::vector<al::byte> mBuffer;
 
@@ -455,7 +454,7 @@ int AlsaPlayback::mixerProc()
         if(state < 0)
         {
             ERR("Invalid state detected: %s\n", snd_strerror(state));
-            aluHandleDisconnect(mDevice, "Bad state: %s", snd_strerror(state));
+            mDevice->handleDisconnect("Bad state: %s", snd_strerror(state));
             break;
         }
 
@@ -493,7 +492,7 @@ int AlsaPlayback::mixerProc()
         avail -= avail%update_size;
 
         // it is possible that contiguous areas are smaller, thus we use a loop
-        std::lock_guard<std::recursive_mutex> _{mMutex};
+        std::lock_guard<std::mutex> _{mMutex};
         while(avail > 0)
         {
             snd_pcm_uframes_t frames{avail};
@@ -508,10 +507,10 @@ int AlsaPlayback::mixerProc()
             }
 
             char *WritePtr{static_cast<char*>(areas->addr) + (offset * areas->step / 8)};
-            aluMixData(mDevice, WritePtr, static_cast<ALuint>(frames), areas->step / samplebits);
+            mDevice->renderSamples(WritePtr, static_cast<uint>(frames), areas->step/samplebits);
 
             snd_pcm_sframes_t commitres{snd_pcm_mmap_commit(mPcmHandle, offset, frames)};
-            if(commitres < 0 || (static_cast<snd_pcm_uframes_t>(commitres)-frames) != 0)
+            if(commitres < 0 || static_cast<snd_pcm_uframes_t>(commitres) != frames)
             {
                 ERR("mmap commit error: %s\n",
                     snd_strerror(commitres >= 0 ? -EPIPE : static_cast<int>(commitres)));
@@ -539,7 +538,7 @@ int AlsaPlayback::mixerNoMMapProc()
         if(state < 0)
         {
             ERR("Invalid state detected: %s\n", snd_strerror(state));
-            aluHandleDisconnect(mDevice, "Bad state: %s", snd_strerror(state));
+            mDevice->handleDisconnect("Bad state: %s", snd_strerror(state));
             break;
         }
 
@@ -575,8 +574,8 @@ int AlsaPlayback::mixerNoMMapProc()
 
         al::byte *WritePtr{mBuffer.data()};
         avail = snd_pcm_bytes_to_frames(mPcmHandle, static_cast<ssize_t>(mBuffer.size()));
-        std::lock_guard<std::recursive_mutex> _{mMutex};
-        aluMixData(mDevice, WritePtr, static_cast<ALuint>(avail), frame_step);
+        std::lock_guard<std::mutex> _{mMutex};
+        mDevice->renderSamples(WritePtr, static_cast<uint>(avail), frame_step);
         while(avail > 0)
         {
             snd_pcm_sframes_t ret{snd_pcm_writei(mPcmHandle, WritePtr,
@@ -614,7 +613,7 @@ int AlsaPlayback::mixerNoMMapProc()
 }
 
 
-void AlsaPlayback::open(const ALCchar *name)
+void AlsaPlayback::open(const char *name)
 {
     const char *driver{};
     if(name)
@@ -627,7 +626,8 @@ void AlsaPlayback::open(const ALCchar *name)
             { return entry.name == name; }
         );
         if(iter == PlaybackDevices.cend())
-            throw al::backend_exception{ALC_INVALID_VALUE, "Device name \"%s\" not found", name};
+            throw al::backend_exception{al::backend_error::NoDevice,
+                "Device name \"%s\" not found", name};
         driver = iter->device_name.c_str();
     }
     else
@@ -635,12 +635,16 @@ void AlsaPlayback::open(const ALCchar *name)
         name = alsaDevice;
         driver = GetConfigValue(nullptr, "alsa", "device", "default");
     }
-
     TRACE("Opening device \"%s\"\n", driver);
-    int err{snd_pcm_open(&mPcmHandle, driver, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)};
+
+    snd_pcm_t *pcmHandle{};
+    int err{snd_pcm_open(&pcmHandle, driver, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)};
     if(err < 0)
-        throw al::backend_exception{ALC_OUT_OF_MEMORY, "Could not open ALSA device \"%s\"",
-            driver};
+        throw al::backend_exception{al::backend_error::NoDevice,
+            "Could not open ALSA device \"%s\"", driver};
+    if(mPcmHandle)
+        snd_pcm_close(mPcmHandle);
+    mPcmHandle = pcmHandle;
 
     /* Free alsa's global config tree. Otherwise valgrind reports a ton of leaks. */
     snd_config_update_free_global();
@@ -677,15 +681,16 @@ bool AlsaPlayback::reset()
     }
 
     bool allowmmap{!!GetConfigValueBool(mDevice->DeviceName.c_str(), "alsa", "mmap", 1)};
-    ALuint periodLen{static_cast<ALuint>(mDevice->UpdateSize * 1000000_u64 / mDevice->Frequency)};
-    ALuint bufferLen{static_cast<ALuint>(mDevice->BufferSize * 1000000_u64 / mDevice->Frequency)};
-    ALuint rate{mDevice->Frequency};
+    uint periodLen{static_cast<uint>(mDevice->UpdateSize * 1000000_u64 / mDevice->Frequency)};
+    uint bufferLen{static_cast<uint>(mDevice->BufferSize * 1000000_u64 / mDevice->Frequency)};
+    uint rate{mDevice->Frequency};
 
     int err{};
     HwParamsPtr hp{CreateHwParams()};
 #define CHECK(x) do {                                                         \
     if((err=(x)) < 0)                                                         \
-        throw al::backend_exception{ALC_INVALID_VALUE, #x " failed: %s", snd_strerror(err)}; \
+        throw al::backend_exception{al::backend_error::DeviceError, #x " failed: %s", \
+            snd_strerror(err)};                                               \
 } while(0)
     CHECK(snd_pcm_hw_params_any(mPcmHandle, hp.get()));
     /* set interleaved access */
@@ -745,8 +750,8 @@ bool AlsaPlayback::reset()
     }
     CHECK(snd_pcm_hw_params_set_channels(mPcmHandle, hp.get(), mDevice->channelsFromFmt()));
     /* set rate (implicitly constrains period/buffer parameters) */
-    if(!GetConfigValueBool(mDevice->DeviceName.c_str(), "alsa", "allow-resampler", 0) ||
-       !mDevice->Flags.get<FrequencyRequest>())
+    if(!GetConfigValueBool(mDevice->DeviceName.c_str(), "alsa", "allow-resampler", 0)
+        || !mDevice->Flags.test(FrequencyRequest))
     {
         if(snd_pcm_hw_params_set_rate_resample(mPcmHandle, hp.get(), 0) < 0)
             ERR("Failed to disable ALSA resampler\n");
@@ -781,28 +786,28 @@ bool AlsaPlayback::reset()
 #undef CHECK
     sp = nullptr;
 
-    mDevice->BufferSize = static_cast<ALuint>(bufferSizeInFrames);
-    mDevice->UpdateSize = static_cast<ALuint>(periodSizeInFrames);
+    mDevice->BufferSize = static_cast<uint>(bufferSizeInFrames);
+    mDevice->UpdateSize = static_cast<uint>(periodSizeInFrames);
     mDevice->Frequency = rate;
 
-    SetDefaultChannelOrder(mDevice);
+    setDefaultChannelOrder();
 
     return true;
 }
 
-bool AlsaPlayback::start()
+void AlsaPlayback::start()
 {
     int err{};
     snd_pcm_access_t access{};
     HwParamsPtr hp{CreateHwParams()};
 #define CHECK(x) do {                                                         \
     if((err=(x)) < 0)                                                         \
-        throw al::backend_exception{ALC_INVALID_VALUE, #x " failed: %s", snd_strerror(err)}; \
+        throw al::backend_exception{al::backend_error::DeviceError, #x " failed: %s", \
+            snd_strerror(err)};                                               \
 } while(0)
     CHECK(snd_pcm_hw_params_current(mPcmHandle, hp.get()));
     /* retrieve configuration info */
     CHECK(snd_pcm_hw_params_get_access(hp.get(), &access));
-#undef CHECK
     hp = nullptr;
 
     int (AlsaPlayback::*thread_func)(){};
@@ -814,25 +819,19 @@ bool AlsaPlayback::start()
     }
     else
     {
-        err = snd_pcm_prepare(mPcmHandle);
-        if(err < 0)
-        {
-            ERR("snd_pcm_prepare(data->mPcmHandle) failed: %s\n", snd_strerror(err));
-            return false;
-        }
+        CHECK(snd_pcm_prepare(mPcmHandle));
         thread_func = &AlsaPlayback::mixerProc;
     }
+#undef CHECK
 
     try {
         mKillNow.store(false, std::memory_order_release);
         mThread = std::thread{std::mem_fn(thread_func), this};
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Could not create playback thread: %s\n", e.what());
+        throw al::backend_exception{al::backend_error::DeviceError,
+            "Failed to start mixing thread: %s", e.what()};
     }
-    mBuffer.clear();
-    return false;
 }
 
 void AlsaPlayback::stop()
@@ -842,13 +841,16 @@ void AlsaPlayback::stop()
     mThread.join();
 
     mBuffer.clear();
+    int err{snd_pcm_drop(mPcmHandle)};
+    if(err < 0)
+        ERR("snd_pcm_drop failed: %s\n", snd_strerror(err));
 }
 
 ClockLatency AlsaPlayback::getClockLatency()
 {
     ClockLatency ret;
 
-    std::lock_guard<std::recursive_mutex> _{mMutex};
+    std::lock_guard<std::mutex> _{mMutex};
     ret.ClockTime = GetDeviceClockTime(mDevice);
     snd_pcm_sframes_t delay{};
     int err{snd_pcm_delay(mPcmHandle, &delay)};
@@ -865,14 +867,14 @@ ClockLatency AlsaPlayback::getClockLatency()
 
 
 struct AlsaCapture final : public BackendBase {
-    AlsaCapture(ALCdevice *device) noexcept : BackendBase{device} { }
+    AlsaCapture(DeviceBase *device) noexcept : BackendBase{device} { }
     ~AlsaCapture() override;
 
-    void open(const ALCchar *name) override;
-    bool start() override;
+    void open(const char *name) override;
+    void start() override;
     void stop() override;
-    ALCenum captureSamples(al::byte *buffer, ALCuint samples) override;
-    ALCuint availableSamples() override;
+    void captureSamples(al::byte *buffer, uint samples) override;
+    uint availableSamples() override;
     ClockLatency getClockLatency() override;
 
     snd_pcm_t *mPcmHandle{nullptr};
@@ -895,7 +897,7 @@ AlsaCapture::~AlsaCapture()
 }
 
 
-void AlsaCapture::open(const ALCchar *name)
+void AlsaCapture::open(const char *name)
 {
     const char *driver{};
     if(name)
@@ -908,7 +910,8 @@ void AlsaCapture::open(const ALCchar *name)
             { return entry.name == name; }
         );
         if(iter == CaptureDevices.cend())
-            throw al::backend_exception{ALC_INVALID_VALUE, "Device name \"%s\" not found", name};
+            throw al::backend_exception{al::backend_error::NoDevice,
+                "Device name \"%s\" not found", name};
         driver = iter->device_name.c_str();
     }
     else
@@ -920,8 +923,8 @@ void AlsaCapture::open(const ALCchar *name)
     TRACE("Opening device \"%s\"\n", driver);
     int err{snd_pcm_open(&mPcmHandle, driver, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK)};
     if(err < 0)
-        throw al::backend_exception{ALC_OUT_OF_MEMORY, "Could not open ALSA device \"%s\"",
-            driver};
+        throw al::backend_exception{al::backend_error::NoDevice,
+            "Could not open ALSA device \"%s\"", driver};
 
     /* Free alsa's global config tree. Otherwise valgrind reports a ton of leaks. */
     snd_config_update_free_global();
@@ -959,7 +962,8 @@ void AlsaCapture::open(const ALCchar *name)
     HwParamsPtr hp{CreateHwParams()};
 #define CHECK(x) do {                                                         \
     if((err=(x)) < 0)                                                         \
-        throw al::backend_exception{ALC_INVALID_VALUE, #x " failed: %s", snd_strerror(err)}; \
+        throw al::backend_exception{al::backend_error::DeviceError, #x " failed: %s", \
+            snd_strerror(err)};                                               \
 } while(0)
     CHECK(snd_pcm_hw_params_any(mPcmHandle, hp.get()));
     /* set interleaved access */
@@ -993,20 +997,19 @@ void AlsaCapture::open(const ALCchar *name)
 }
 
 
-bool AlsaCapture::start()
+void AlsaCapture::start()
 {
     int err{snd_pcm_prepare(mPcmHandle)};
     if(err < 0)
-        throw al::backend_exception{ALC_INVALID_VALUE, "snd_pcm_prepare failed: %s",
+        throw al::backend_exception{al::backend_error::DeviceError, "snd_pcm_prepare failed: %s",
             snd_strerror(err)};
 
     err = snd_pcm_start(mPcmHandle);
     if(err < 0)
-        throw al::backend_exception{ALC_INVALID_VALUE, "snd_pcm_start failed: %s",
+        throw al::backend_exception{al::backend_error::DeviceError, "snd_pcm_start failed: %s",
             snd_strerror(err)};
 
     mDoCapture = true;
-    return true;
 }
 
 void AlsaCapture::stop()
@@ -1015,11 +1018,12 @@ void AlsaCapture::stop()
      * snd_pcm_drain is unreliable and snd_pcm_drop drops it. Capture what's
      * available now so it'll be available later after the drop.
      */
-    ALCuint avail{availableSamples()};
+    uint avail{availableSamples()};
     if(!mRing && avail > 0)
     {
         /* The ring buffer implicitly captures when checking availability.
-         * Direct access needs to explicitly capture it into temp storage. */
+         * Direct access needs to explicitly capture it into temp storage.
+         */
         auto temp = al::vector<al::byte>(
             static_cast<size_t>(snd_pcm_frames_to_bytes(mPcmHandle, avail)));
         captureSamples(temp.data(), avail);
@@ -1031,12 +1035,12 @@ void AlsaCapture::stop()
     mDoCapture = false;
 }
 
-ALCenum AlsaCapture::captureSamples(al::byte *buffer, ALCuint samples)
+void AlsaCapture::captureSamples(al::byte *buffer, uint samples)
 {
     if(mRing)
     {
         mRing->read(buffer, samples);
-        return ALC_NO_ERROR;
+        return;
     }
 
     mLastAvail -= samples;
@@ -1074,7 +1078,7 @@ ALCenum AlsaCapture::captureSamples(al::byte *buffer, ALCuint samples)
             {
                 const char *err{snd_strerror(static_cast<int>(amt))};
                 ERR("restore error: %s\n", err);
-                aluHandleDisconnect(mDevice, "Capture recovery failure: %s", err);
+                mDevice->handleDisconnect("Capture recovery failure: %s", err);
                 break;
             }
             /* If the amount available is less than what's asked, we lost it
@@ -1085,16 +1089,14 @@ ALCenum AlsaCapture::captureSamples(al::byte *buffer, ALCuint samples)
         }
 
         buffer = buffer + amt;
-        samples -= static_cast<ALCuint>(amt);
+        samples -= static_cast<uint>(amt);
     }
     if(samples > 0)
         std::fill_n(buffer, snd_pcm_frames_to_bytes(mPcmHandle, samples),
             al::byte((mDevice->FmtType == DevFmtUByte) ? 0x80 : 0));
-
-    return ALC_NO_ERROR;
 }
 
-ALCuint AlsaCapture::availableSamples()
+uint AlsaCapture::availableSamples()
 {
     snd_pcm_sframes_t avail{0};
     if(mDevice->Connected.load(std::memory_order_acquire) && mDoCapture)
@@ -1114,7 +1116,7 @@ ALCuint AlsaCapture::availableSamples()
         {
             const char *err{snd_strerror(static_cast<int>(avail))};
             ERR("restore error: %s\n", err);
-            aluHandleDisconnect(mDevice, "Capture recovery failure: %s", err);
+            mDevice->handleDisconnect("Capture recovery failure: %s", err);
         }
     }
 
@@ -1123,7 +1125,7 @@ ALCuint AlsaCapture::availableSamples()
         if(avail < 0) avail = 0;
         avail += snd_pcm_bytes_to_frames(mPcmHandle, static_cast<ssize_t>(mBuffer.size()));
         if(avail > mLastAvail) mLastAvail = avail;
-        return static_cast<ALCuint>(mLastAvail);
+        return static_cast<uint>(mLastAvail);
     }
 
     while(avail > 0)
@@ -1150,7 +1152,7 @@ ALCuint AlsaCapture::availableSamples()
             {
                 const char *err{snd_strerror(static_cast<int>(amt))};
                 ERR("restore error: %s\n", err);
-                aluHandleDisconnect(mDevice, "Capture recovery failure: %s", err);
+                mDevice->handleDisconnect("Capture recovery failure: %s", err);
                 break;
             }
             avail = amt;
@@ -1161,14 +1163,13 @@ ALCuint AlsaCapture::availableSamples()
         avail -= amt;
     }
 
-    return static_cast<ALCuint>(mRing->readSpace());
+    return static_cast<uint>(mRing->readSpace());
 }
 
 ClockLatency AlsaCapture::getClockLatency()
 {
     ClockLatency ret;
 
-    std::lock_guard<std::recursive_mutex> _{mMutex};
     ret.ClockTime = GetDeviceClockTime(mDevice);
     snd_pcm_sframes_t delay{};
     int err{snd_pcm_delay(mPcmHandle, &delay)};
@@ -1199,10 +1200,10 @@ bool AlsaBackendFactory::init()
         if(!alsa_handle)
         {
             WARN("Failed to load %s\n", "libasound.so.2");
-            return ALC_FALSE;
+            return false;
         }
 
-        error = ALC_FALSE;
+        error = false;
 #define LOAD_FUNC(f) do {                                                     \
     p##f = reinterpret_cast<decltype(p##f)>(GetSymbol(alsa_handle, #f));      \
     if(p##f == nullptr) {                                                     \
@@ -1228,30 +1229,34 @@ bool AlsaBackendFactory::init()
 bool AlsaBackendFactory::querySupport(BackendType type)
 { return (type == BackendType::Playback || type == BackendType::Capture); }
 
-void AlsaBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string AlsaBackendFactory::probe(BackendType type)
 {
-    auto add_device = [outnames](const DevMap &entry) -> void
+    std::string outnames;
+
+    auto add_device = [&outnames](const DevMap &entry) -> void
     {
         /* +1 to also append the null char (to ensure a null-separated list and
          * double-null terminated list).
          */
-        outnames->append(entry.name.c_str(), entry.name.length()+1);
+        outnames.append(entry.name.c_str(), entry.name.length()+1);
     };
     switch(type)
     {
-        case DevProbe::Playback:
-            PlaybackDevices = probe_devices(SND_PCM_STREAM_PLAYBACK);
-            std::for_each(PlaybackDevices.cbegin(), PlaybackDevices.cend(), add_device);
-            break;
+    case BackendType::Playback:
+        PlaybackDevices = probe_devices(SND_PCM_STREAM_PLAYBACK);
+        std::for_each(PlaybackDevices.cbegin(), PlaybackDevices.cend(), add_device);
+        break;
 
-        case DevProbe::Capture:
-            CaptureDevices = probe_devices(SND_PCM_STREAM_CAPTURE);
-            std::for_each(CaptureDevices.cbegin(), CaptureDevices.cend(), add_device);
-            break;
+    case BackendType::Capture:
+        CaptureDevices = probe_devices(SND_PCM_STREAM_CAPTURE);
+        std::for_each(CaptureDevices.cbegin(), CaptureDevices.cend(), add_device);
+        break;
     }
+
+    return outnames;
 }
 
-BackendPtr AlsaBackendFactory::createBackend(ALCdevice *device, BackendType type)
+BackendPtr AlsaBackendFactory::createBackend(DeviceBase *device, BackendType type)
 {
     if(type == BackendType::Playback)
         return BackendPtr{new AlsaPlayback{device}};

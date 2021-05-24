@@ -35,25 +35,31 @@
 #include <mutex>
 #include <new>
 #include <numeric>
+#include <stdexcept>
 #include <utility>
 
 #include "AL/al.h"
 #include "AL/alc.h"
 #include "AL/alext.h"
 
+#include "albit.h"
 #include "albyte.h"
-#include "alcmain.h"
-#include "alcontext.h"
-#include "alexcpt.h"
+#include "alc/context.h"
+#include "alc/device.h"
+#include "alc/inprogext.h"
 #include "almalloc.h"
 #include "alnumeric.h"
 #include "aloptional.h"
 #include "atomic.h"
-#include "inprogext.h"
+#include "core/except.h"
+#include "core/logging.h"
+#include "core/voice.h"
 #include "opthelpers.h"
 
 
 namespace {
+
+constexpr int MaxAdpcmChannels{2};
 
 /* IMA ADPCM Stepsize table */
 constexpr int IMAStep_size[89] = {
@@ -99,11 +105,11 @@ constexpr int MSADPCMAdaptionCoeff[7][2] = {
 };
 
 
-void DecodeIMA4Block(ALshort *dst, const al::byte *src, size_t numchans, size_t align)
+void DecodeIMA4Block(int16_t *dst, const al::byte *src, size_t numchans, size_t align)
 {
-    ALint sample[MAX_INPUT_CHANNELS]{};
-    ALint index[MAX_INPUT_CHANNELS]{};
-    ALuint code[MAX_INPUT_CHANNELS]{};
+    int sample[MaxAdpcmChannels]{};
+    int index[MaxAdpcmChannels]{};
+    ALuint code[MaxAdpcmChannels]{};
 
     for(size_t c{0};c < numchans;c++)
     {
@@ -114,7 +120,7 @@ void DecodeIMA4Block(ALshort *dst, const al::byte *src, size_t numchans, size_t 
         index[c] = clampi((index[c]^0x8000) - 32768, 0, 88);
         src += 2;
 
-        *(dst++) = static_cast<ALshort>(sample[c]);
+        *(dst++) = static_cast<int16_t>(sample[c]);
     }
 
     for(size_t i{1};i < align;i++)
@@ -140,16 +146,16 @@ void DecodeIMA4Block(ALshort *dst, const al::byte *src, size_t numchans, size_t 
             index[c] += IMA4Index_adjust[nibble];
             index[c] = clampi(index[c], 0, 88);
 
-            *(dst++) = static_cast<ALshort>(sample[c]);
+            *(dst++) = static_cast<int16_t>(sample[c]);
         }
     }
 }
 
-void DecodeMSADPCMBlock(ALshort *dst, const al::byte *src, size_t numchans, size_t align)
+void DecodeMSADPCMBlock(int16_t *dst, const al::byte *src, size_t numchans, size_t align)
 {
-    ALubyte blockpred[MAX_INPUT_CHANNELS]{};
-    ALint delta[MAX_INPUT_CHANNELS]{};
-    ALshort samples[MAX_INPUT_CHANNELS][2]{};
+    uint8_t blockpred[MaxAdpcmChannels]{};
+    int delta[MaxAdpcmChannels]{};
+    int16_t samples[MaxAdpcmChannels][2]{};
 
     for(size_t c{0};c < numchans;c++)
     {
@@ -193,25 +199,26 @@ void DecodeMSADPCMBlock(ALshort *dst, const al::byte *src, size_t numchans, size
             else
                 nibble = *(src++) & 0x0f;
 
-            ALint pred{(samples[c][0]*MSADPCMAdaptionCoeff[blockpred[c]][0] +
+            int pred{(samples[c][0]*MSADPCMAdaptionCoeff[blockpred[c]][0] +
                 samples[c][1]*MSADPCMAdaptionCoeff[blockpred[c]][1]) / 256};
             pred += (al::to_integer<int>(nibble^0x08) - 0x08) * delta[c];
             pred  = clampi(pred, -32768, 32767);
 
             samples[c][1] = samples[c][0];
-            samples[c][0] = static_cast<ALshort>(pred);
+            samples[c][0] = static_cast<int16_t>(pred);
 
             delta[c] = (MSADPCMAdaption[al::to_integer<ALubyte>(nibble)] * delta[c]) / 256;
             delta[c] = maxi(16, delta[c]);
 
-            *(dst++) = static_cast<ALshort>(pred);
+            *(dst++) = static_cast<int16_t>(pred);
         }
     }
 }
 
-void Convert_ALshort_ALima4(ALshort *dst, const al::byte *src, size_t numchans, size_t len,
+void Convert_int16_ima4(int16_t *dst, const al::byte *src, size_t numchans, size_t len,
     size_t align)
 {
+    assert(numchans <= MaxAdpcmChannels);
     const size_t byte_align{((align-1)/2 + 4) * numchans};
 
     len /= align;
@@ -223,9 +230,10 @@ void Convert_ALshort_ALima4(ALshort *dst, const al::byte *src, size_t numchans, 
     }
 }
 
-void Convert_ALshort_ALmsadpcm(ALshort *dst, const al::byte *src, size_t numchans, size_t len,
+void Convert_int16_msadpcm(int16_t *dst, const al::byte *src, size_t numchans, size_t len,
     size_t align)
 {
+    assert(numchans <= MaxAdpcmChannels);
     const size_t byte_align{((align-2)/2 + 7) * numchans};
 
     len /= align;
@@ -238,22 +246,22 @@ void Convert_ALshort_ALmsadpcm(ALshort *dst, const al::byte *src, size_t numchan
 }
 
 
-ALuint BytesFromUserFmt(UserFmtType type)
+ALuint BytesFromUserFmt(UserFmtType type) noexcept
 {
     switch(type)
     {
-    case UserFmtUByte: return sizeof(ALubyte);
-    case UserFmtShort: return sizeof(ALshort);
-    case UserFmtFloat: return sizeof(ALfloat);
-    case UserFmtDouble: return sizeof(ALdouble);
-    case UserFmtMulaw: return sizeof(ALubyte);
-    case UserFmtAlaw: return sizeof(ALubyte);
+    case UserFmtUByte: return sizeof(uint8_t);
+    case UserFmtShort: return sizeof(int16_t);
+    case UserFmtFloat: return sizeof(float);
+    case UserFmtDouble: return sizeof(double);
+    case UserFmtMulaw: return sizeof(uint8_t);
+    case UserFmtAlaw: return sizeof(uint8_t);
     case UserFmtIMA4: break; /* not handled here */
     case UserFmtMSADPCM: break; /* not handled here */
     }
     return 0;
 }
-ALuint ChannelsFromUserFmt(UserFmtChannels chans)
+ALuint ChannelsFromUserFmt(UserFmtChannels chans, ALuint ambiorder) noexcept
 {
     switch(chans)
     {
@@ -264,13 +272,54 @@ ALuint ChannelsFromUserFmt(UserFmtChannels chans)
     case UserFmtX51: return 6;
     case UserFmtX61: return 7;
     case UserFmtX71: return 8;
-    case UserFmtBFormat2D: return 3;
-    case UserFmtBFormat3D: return 4;
+    case UserFmtBFormat2D: return (ambiorder*2) + 1;
+    case UserFmtBFormat3D: return (ambiorder+1) * (ambiorder+1);
+    case UserFmtUHJ2: return 2;
+    case UserFmtUHJ3: return 3;
+    case UserFmtUHJ4: return 4;
     }
     return 0;
 }
-inline ALuint FrameSizeFromUserFmt(UserFmtChannels chans, UserFmtType type)
-{ return ChannelsFromUserFmt(chans) * BytesFromUserFmt(type); }
+
+al::optional<AmbiLayout> AmbiLayoutFromEnum(ALenum layout)
+{
+    switch(layout)
+    {
+    case AL_FUMA_SOFT: return al::make_optional(AmbiLayout::FuMa);
+    case AL_ACN_SOFT: return al::make_optional(AmbiLayout::ACN);
+    }
+    return al::nullopt;
+}
+ALenum EnumFromAmbiLayout(AmbiLayout layout)
+{
+    switch(layout)
+    {
+    case AmbiLayout::FuMa: return AL_FUMA_SOFT;
+    case AmbiLayout::ACN: return AL_ACN_SOFT;
+    }
+    throw std::runtime_error{"Invalid AmbiLayout: "+std::to_string(int(layout))};
+}
+
+al::optional<AmbiScaling> AmbiScalingFromEnum(ALenum scale)
+{
+    switch(scale)
+    {
+    case AL_FUMA_SOFT: return al::make_optional(AmbiScaling::FuMa);
+    case AL_SN3D_SOFT: return al::make_optional(AmbiScaling::SN3D);
+    case AL_N3D_SOFT: return al::make_optional(AmbiScaling::N3D);
+    }
+    return al::nullopt;
+}
+ALenum EnumFromAmbiScaling(AmbiScaling scale)
+{
+    switch(scale)
+    {
+    case AmbiScaling::FuMa: return AL_FUMA_SOFT;
+    case AmbiScaling::SN3D: return AL_SN3D_SOFT;
+    case AmbiScaling::N3D: return AL_SN3D_SOFT;
+    }
+    throw std::runtime_error{"Invalid AmbiScaling: "+std::to_string(int(scale))};
+}
 
 
 constexpr ALbitfieldSOFT INVALID_STORAGE_MASK{~unsigned(AL_MAP_READ_BIT_SOFT |
@@ -284,8 +333,7 @@ bool EnsureBuffers(ALCdevice *device, size_t needed)
 {
     size_t count{std::accumulate(device->BufferList.cbegin(), device->BufferList.cend(), size_t{0},
         [](size_t cur, const BufferSubList &sublist) noexcept -> size_t
-        { return cur + static_cast<ALuint>(POPCNT64(sublist.FreeMask)); }
-    )};
+        { return cur + static_cast<ALuint>(al::popcount(sublist.FreeMask)); })};
 
     while(needed > count)
     {
@@ -314,7 +362,7 @@ ALbuffer *AllocBuffer(ALCdevice *device)
     );
 
     auto lidx = static_cast<ALuint>(std::distance(device->BufferList.begin(), sublist));
-    auto slidx = static_cast<ALuint>(CTZ64(sublist->FreeMask));
+    auto slidx = static_cast<ALuint>(al::countr_zero(sublist->FreeMask));
 
     ALbuffer *buffer{::new (sublist->Buffers + slidx) ALbuffer{}};
 
@@ -389,8 +437,8 @@ const ALchar *NameFromUserFmtType(UserFmtType type)
 {
     switch(type)
     {
-    case UserFmtUByte: return "Unsigned Byte";
-    case UserFmtShort: return "Signed Short";
+    case UserFmtUByte: return "UInt8";
+    case UserFmtShort: return "Int16";
     case UserFmtFloat: return "Float32";
     case UserFmtDouble: return "Float64";
     case UserFmtMulaw: return "muLaw";
@@ -423,6 +471,9 @@ void LoadData(ALCcontext *context, ALbuffer *ALBuf, ALsizei freq, ALuint size,
     case UserFmtX71: DstChannels = FmtX71; break;
     case UserFmtBFormat2D: DstChannels = FmtBFormat2D; break;
     case UserFmtBFormat3D: DstChannels = FmtBFormat3D; break;
+    case UserFmtUHJ2: DstChannels = FmtUHJ2; break;
+    case UserFmtUHJ3: DstChannels = FmtUHJ3; break;
+    case UserFmtUHJ4: DstChannels = FmtUHJ4; break;
     }
     if UNLIKELY(static_cast<long>(SrcChannels) != static_cast<long>(DstChannels))
         SETERR_RETURN(context, AL_INVALID_ENUM, , "Invalid format");
@@ -458,23 +509,29 @@ void LoadData(ALCcontext *context, ALbuffer *ALBuf, ALsizei freq, ALuint size,
         SETERR_RETURN(context, AL_INVALID_VALUE,, "Invalid unpack alignment %u for %s samples",
             unpackalign, NameFromUserFmtType(SrcType));
 
+    const ALuint ambiorder{(DstChannels == FmtBFormat2D || DstChannels == FmtBFormat3D) ?
+        ALBuf->UnpackAmbiOrder :
+        ((DstChannels == FmtUHJ2 || DstChannels == FmtUHJ3 || DstChannels == FmtUHJ4) ? 1 :
+        0)};
+
     if((access&AL_PRESERVE_DATA_BIT_SOFT))
     {
         /* Can only preserve data with the same format and alignment. */
-        if UNLIKELY(ALBuf->mFmtChannels != DstChannels || ALBuf->OriginalType != SrcType)
+        if UNLIKELY(ALBuf->mChannels != DstChannels || ALBuf->OriginalType != SrcType)
             SETERR_RETURN(context, AL_INVALID_VALUE,, "Preserving data of mismatched format");
         if UNLIKELY(ALBuf->OriginalAlign != align)
             SETERR_RETURN(context, AL_INVALID_VALUE,, "Preserving data of mismatched alignment");
+        if(ALBuf->mAmbiOrder != ambiorder)
+            SETERR_RETURN(context, AL_INVALID_VALUE,, "Preserving data of mismatched order");
     }
 
     /* Convert the input/source size in bytes to sample frames using the unpack
      * block alignment.
      */
-    const ALuint SrcByteAlign{
-        (SrcType == UserFmtIMA4) ? ((align-1)/2 + 4) * ChannelsFromUserFmt(SrcChannels) :
-        (SrcType == UserFmtMSADPCM) ? ((align-2)/2 + 7) * ChannelsFromUserFmt(SrcChannels) :
-        (align * FrameSizeFromUserFmt(SrcChannels, SrcType))
-    };
+    const ALuint SrcByteAlign{ChannelsFromUserFmt(SrcChannels, ambiorder) *
+        ((SrcType == UserFmtIMA4) ? (align-1)/2 + 4 :
+        (SrcType == UserFmtMSADPCM) ? (align-2)/2 + 7 :
+        (align * BytesFromUserFmt(SrcType)))};
     if UNLIKELY((size%SrcByteAlign) != 0)
         SETERR_RETURN(context, AL_INVALID_VALUE,,
             "Data size %d is not a multiple of frame size %d (%d unpack alignment)",
@@ -488,7 +545,7 @@ void LoadData(ALCcontext *context, ALbuffer *ALBuf, ALsizei freq, ALuint size,
     /* Convert the sample frames to the number of bytes needed for internal
      * storage.
      */
-    ALuint NumChannels{ChannelsFromFmt(DstChannels)};
+    ALuint NumChannels{ChannelsFromFmt(DstChannels, ambiorder)};
     ALuint FrameSize{NumChannels * BytesFromFmt(DstType)};
     if UNLIKELY(frames > std::numeric_limits<size_t>::max()/FrameSize)
         SETERR_RETURN(context, AL_OUT_OF_MEMORY,,
@@ -510,23 +567,23 @@ void LoadData(ALCcontext *context, ALbuffer *ALBuf, ALsizei freq, ALuint size,
             const size_t tocopy{minz(newdata.size(), ALBuf->mData.size())};
             std::copy_n(ALBuf->mData.begin(), tocopy, newdata.begin());
         }
-        ALBuf->mData = std::move(newdata);
+        newdata.swap(ALBuf->mData);
     }
 
     if(SrcType == UserFmtIMA4)
     {
         assert(DstType == FmtShort);
         if(SrcData != nullptr && !ALBuf->mData.empty())
-            Convert_ALshort_ALima4(reinterpret_cast<ALshort*>(ALBuf->mData.data()),
-                SrcData, NumChannels, frames, align);
+            Convert_int16_ima4(reinterpret_cast<int16_t*>(ALBuf->mData.data()), SrcData,
+                NumChannels, frames, align);
         ALBuf->OriginalAlign = align;
     }
     else if(SrcType == UserFmtMSADPCM)
     {
         assert(DstType == FmtShort);
         if(SrcData != nullptr && !ALBuf->mData.empty())
-            Convert_ALshort_ALmsadpcm(reinterpret_cast<ALshort*>(ALBuf->mData.data()),
-                SrcData, NumChannels, frames, align);
+            Convert_int16_msadpcm(reinterpret_cast<int16_t*>(ALBuf->mData.data()), SrcData,
+                NumChannels, frames, align);
         ALBuf->OriginalAlign = align;
     }
     else
@@ -539,17 +596,19 @@ void LoadData(ALCcontext *context, ALbuffer *ALBuf, ALsizei freq, ALuint size,
     ALBuf->OriginalSize = size;
     ALBuf->OriginalType = SrcType;
 
-    ALBuf->Frequency = static_cast<ALuint>(freq);
-    ALBuf->mFmtChannels = DstChannels;
-    ALBuf->mFmtType = DstType;
     ALBuf->Access = access;
 
-    ALBuf->Callback = nullptr;
-    ALBuf->UserData = nullptr;
+    ALBuf->mSampleRate = static_cast<ALuint>(freq);
+    ALBuf->mChannels = DstChannels;
+    ALBuf->mType = DstType;
+    ALBuf->mAmbiOrder = ambiorder;
 
-    ALBuf->SampleLen = frames;
-    ALBuf->LoopStart = 0;
-    ALBuf->LoopEnd = ALBuf->SampleLen;
+    ALBuf->mCallback = nullptr;
+    ALBuf->mUserData = nullptr;
+
+    ALBuf->mSampleLen = frames;
+    ALBuf->mLoopStart = 0;
+    ALBuf->mLoopEnd = ALBuf->mSampleLen;
 }
 
 /** Prepares the buffer to use the specified callback, using the specified format. */
@@ -574,6 +633,9 @@ void PrepareCallback(ALCcontext *context, ALbuffer *ALBuf, ALsizei freq,
     case UserFmtX71: DstChannels = FmtX71; break;
     case UserFmtBFormat2D: DstChannels = FmtBFormat2D; break;
     case UserFmtBFormat3D: DstChannels = FmtBFormat3D; break;
+    case UserFmtUHJ2: DstChannels = FmtUHJ2; break;
+    case UserFmtUHJ3: DstChannels = FmtUHJ3; break;
+    case UserFmtUHJ4: DstChannels = FmtUHJ4; break;
     }
     if UNLIKELY(static_cast<long>(SrcChannels) != static_cast<long>(DstChannels))
         SETERR_RETURN(context, AL_INVALID_ENUM,, "Invalid format");
@@ -594,24 +656,31 @@ void PrepareCallback(ALCcontext *context, ALbuffer *ALBuf, ALsizei freq,
     if UNLIKELY(static_cast<long>(SrcType) != static_cast<long>(DstType))
         SETERR_RETURN(context, AL_INVALID_ENUM,, "Unsupported callback format");
 
-    ALBuf->mData = al::vector<al::byte,16>(FrameSizeFromFmt(DstChannels, DstType) *
-        size_t{BUFFERSIZE + (MAX_RESAMPLER_PADDING>>1)});
+    const ALuint ambiorder{(DstChannels == FmtBFormat2D || DstChannels == FmtBFormat3D) ?
+        ALBuf->UnpackAmbiOrder :
+        ((DstChannels == FmtUHJ2 || DstChannels == FmtUHJ3 || DstChannels == FmtUHJ4) ? 1 :
+        0)};
 
-    ALBuf->Callback = callback;
-    ALBuf->UserData = userptr;
+    constexpr uint line_size{BufferLineSize + MaxPostVoiceLoad};
+    al::vector<al::byte,16>(FrameSizeFromFmt(DstChannels, DstType, ambiorder) *
+        size_t{line_size}).swap(ALBuf->mData);
+
+    ALBuf->mCallback = callback;
+    ALBuf->mUserData = userptr;
 
     ALBuf->OriginalType = SrcType;
     ALBuf->OriginalSize = 0;
     ALBuf->OriginalAlign = 1;
-
-    ALBuf->Frequency = static_cast<ALuint>(freq);
-    ALBuf->mFmtChannels = DstChannels;
-    ALBuf->mFmtType = DstType;
     ALBuf->Access = 0;
 
-    ALBuf->SampleLen = 0;
-    ALBuf->LoopStart = 0;
-    ALBuf->LoopEnd = ALBuf->SampleLen;
+    ALBuf->mSampleRate = static_cast<ALuint>(freq);
+    ALBuf->mChannels = DstChannels;
+    ALBuf->mType = DstType;
+    ALBuf->mAmbiOrder = ambiorder;
+
+    ALBuf->mSampleLen = 0;
+    ALBuf->mLoopStart = 0;
+    ALBuf->mLoopEnd = ALBuf->mSampleLen;
 }
 
 
@@ -623,7 +692,7 @@ al::optional<DecompResult> DecomposeUserFormat(ALenum format)
         UserFmtChannels channels;
         UserFmtType type;
     };
-    static const std::array<FormatMap,46> UserFmtList{{
+    static const std::array<FormatMap,55> UserFmtList{{
         { AL_FORMAT_MONO8,             UserFmtMono, UserFmtUByte   },
         { AL_FORMAT_MONO16,            UserFmtMono, UserFmtShort   },
         { AL_FORMAT_MONO_FLOAT32,      UserFmtMono, UserFmtFloat   },
@@ -679,6 +748,18 @@ al::optional<DecompResult> DecomposeUserFormat(ALenum format)
         { AL_FORMAT_BFORMAT3D_16,      UserFmtBFormat3D, UserFmtShort },
         { AL_FORMAT_BFORMAT3D_FLOAT32, UserFmtBFormat3D, UserFmtFloat },
         { AL_FORMAT_BFORMAT3D_MULAW,   UserFmtBFormat3D, UserFmtMulaw },
+
+        { AL_FORMAT_UHJ2CHN8_SOFT,        UserFmtUHJ2, UserFmtUByte },
+        { AL_FORMAT_UHJ2CHN16_SOFT,       UserFmtUHJ2, UserFmtShort },
+        { AL_FORMAT_UHJ2CHN_FLOAT32_SOFT, UserFmtUHJ2, UserFmtFloat },
+
+        { AL_FORMAT_UHJ3CHN8_SOFT,        UserFmtUHJ3, UserFmtUByte },
+        { AL_FORMAT_UHJ3CHN16_SOFT,       UserFmtUHJ3, UserFmtShort },
+        { AL_FORMAT_UHJ3CHN_FLOAT32_SOFT, UserFmtUHJ3, UserFmtFloat },
+
+        { AL_FORMAT_UHJ4CHN8_SOFT,        UserFmtUHJ4, UserFmtUByte },
+        { AL_FORMAT_UHJ4CHN16_SOFT,       UserFmtUHJ4, UserFmtShort },
+        { AL_FORMAT_UHJ4CHN_FLOAT32_SOFT, UserFmtUHJ4, UserFmtFloat },
     }};
 
     for(const auto &fmt : UserFmtList)
@@ -692,7 +773,7 @@ al::optional<DecompResult> DecomposeUserFormat(ALenum format)
 } // namespace
 
 
-AL_API ALvoid AL_APIENTRY alGenBuffers(ALsizei n, ALuint *buffers)
+AL_API void AL_APIENTRY alGenBuffers(ALsizei n, ALuint *buffers)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -702,7 +783,7 @@ START_API_FUNC
         context->setError(AL_INVALID_VALUE, "Generating %d buffers", n);
     if UNLIKELY(n <= 0) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
     if(!EnsureBuffers(device, static_cast<ALuint>(n)))
     {
@@ -732,7 +813,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDeleteBuffers(ALsizei n, const ALuint *buffers)
+AL_API void AL_APIENTRY alDeleteBuffers(ALsizei n, const ALuint *buffers)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -742,7 +823,7 @@ START_API_FUNC
         context->setError(AL_INVALID_VALUE, "Deleting %d buffers", n);
     if UNLIKELY(n <= 0) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     /* First try to find any buffers that are invalid or in-use. */
@@ -782,7 +863,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if LIKELY(context)
     {
-        ALCdevice *device{context->mDevice.get()};
+        ALCdevice *device{context->mALDevice.get()};
         std::lock_guard<std::mutex> _{device->BufferLock};
         if(!buffer || LookupBuffer(device, buffer))
             return AL_TRUE;
@@ -792,7 +873,7 @@ START_API_FUNC
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alBufferData(ALuint buffer, ALenum format, const ALvoid *data, ALsizei size, ALsizei freq)
+AL_API void AL_APIENTRY alBufferData(ALuint buffer, ALenum format, const ALvoid *data, ALsizei size, ALsizei freq)
 START_API_FUNC
 { alBufferStorageSOFT(buffer, format, data, size, freq, 0); }
 END_API_FUNC
@@ -803,7 +884,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -837,7 +918,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return nullptr;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -872,7 +953,7 @@ START_API_FUNC
                 offset, length, buffer);
         else
         {
-            void *retval = albuf->mData.data() + offset;
+            void *retval{albuf->mData.data() + offset};
             albuf->MappedAccess = access;
             albuf->MappedOffset = offset;
             albuf->MappedSize = length;
@@ -890,7 +971,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -913,7 +994,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -939,13 +1020,13 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alBufferSubDataSOFT(ALuint buffer, ALenum format, const ALvoid *data, ALsizei offset, ALsizei length)
+AL_API void AL_APIENTRY alBufferSubDataSOFT(ALuint buffer, ALenum format, const ALvoid *data, ALsizei offset, ALsizei length)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -966,13 +1047,15 @@ START_API_FUNC
     ALuint align{SanitizeAlignment(usrfmt->type, unpack_align)};
     if UNLIKELY(align < 1)
         context->setError(AL_INVALID_VALUE, "Invalid unpack alignment %u", unpack_align);
-    else if UNLIKELY(long{usrfmt->channels} != long{albuf->mFmtChannels}
+    else if UNLIKELY(long{usrfmt->channels} != long{albuf->mChannels}
         || usrfmt->type != albuf->OriginalType)
         context->setError(AL_INVALID_ENUM, "Unpacking data with mismatched format");
     else if UNLIKELY(align != albuf->OriginalAlign)
         context->setError(AL_INVALID_VALUE,
             "Unpacking data with alignment %u does not match original alignment %u", align,
             albuf->OriginalAlign);
+    else if UNLIKELY(albuf->isBFormat() && albuf->UnpackAmbiOrder != albuf->mAmbiOrder)
+        context->setError(AL_INVALID_VALUE, "Unpacking data with mismatched ambisonic order");
     else if UNLIKELY(albuf->MappedAccess != 0)
         context->setError(AL_INVALID_OPERATION, "Unpacking data into mapped buffer %u", buffer);
     else
@@ -1004,15 +1087,15 @@ START_API_FUNC
             size_t samplen{static_cast<ALuint>(length)/byte_align * align};
 
             void *dst = albuf->mData.data() + byteoff;
-            if(usrfmt->type == UserFmtIMA4 && albuf->mFmtType == FmtShort)
-                Convert_ALshort_ALima4(static_cast<ALshort*>(dst),
-                    static_cast<const al::byte*>(data), num_chans, samplen, align);
-            else if(usrfmt->type == UserFmtMSADPCM && albuf->mFmtType == FmtShort)
-                Convert_ALshort_ALmsadpcm(static_cast<ALshort*>(dst),
+            if(usrfmt->type == UserFmtIMA4 && albuf->mType == FmtShort)
+                Convert_int16_ima4(static_cast<int16_t*>(dst), static_cast<const al::byte*>(data),
+                    num_chans, samplen, align);
+            else if(usrfmt->type == UserFmtMSADPCM && albuf->mType == FmtShort)
+                Convert_int16_msadpcm(static_cast<int16_t*>(dst),
                     static_cast<const al::byte*>(data), num_chans, samplen, align);
             else
             {
-                assert(long{usrfmt->type} == long{albuf->mFmtType});
+                assert(long{usrfmt->type} == long{albuf->mType});
                 memcpy(dst, data, size_t{samplen} * frame_size);
             }
         }
@@ -1073,7 +1156,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
@@ -1093,7 +1176,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
@@ -1112,7 +1195,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
@@ -1134,7 +1217,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -1163,7 +1246,7 @@ START_API_FUNC
         else if UNLIKELY(value != AL_FUMA_SOFT && value != AL_ACN_SOFT)
             context->setError(AL_INVALID_VALUE, "Invalid unpack ambisonic layout %04x", value);
         else
-            albuf->AmbiLayout = value;
+            albuf->mAmbiLayout = AmbiLayoutFromEnum(value).value();
         break;
 
     case AL_AMBISONIC_SCALING_SOFT:
@@ -1173,7 +1256,14 @@ START_API_FUNC
         else if UNLIKELY(value != AL_FUMA_SOFT && value != AL_SN3D_SOFT && value != AL_N3D_SOFT)
             context->setError(AL_INVALID_VALUE, "Invalid unpack ambisonic scaling %04x", value);
         else
-            albuf->AmbiScaling = value;
+            albuf->mAmbiScaling = AmbiScalingFromEnum(value).value();
+        break;
+
+    case AL_UNPACK_AMBISONIC_ORDER_SOFT:
+        if UNLIKELY(value < 1 || value > 14)
+            context->setError(AL_INVALID_VALUE, "Invalid unpack ambisonic order %d", value);
+        else
+            albuf->UnpackAmbiOrder = static_cast<ALuint>(value);
         break;
 
     default:
@@ -1189,7 +1279,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
@@ -1213,6 +1303,7 @@ START_API_FUNC
         case AL_PACK_BLOCK_ALIGNMENT_SOFT:
         case AL_AMBISONIC_LAYOUT_SOFT:
         case AL_AMBISONIC_SCALING_SOFT:
+        case AL_UNPACK_AMBISONIC_ORDER_SOFT:
             alBufferi(buffer, param, values[0]);
             return;
         }
@@ -1221,7 +1312,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -1236,13 +1327,13 @@ START_API_FUNC
             context->setError(AL_INVALID_OPERATION, "Modifying in-use buffer %u's loop points",
                 buffer);
         else if UNLIKELY(values[0] < 0 || values[0] >= values[1]
-            || static_cast<ALuint>(values[1]) > albuf->SampleLen)
+            || static_cast<ALuint>(values[1]) > albuf->mSampleLen)
             context->setError(AL_INVALID_VALUE, "Invalid loop point range %d -> %d on buffer %u",
                 values[0], values[1], buffer);
         else
         {
-            albuf->LoopStart = static_cast<ALuint>(values[0]);
-            albuf->LoopEnd = static_cast<ALuint>(values[1]);
+            albuf->mLoopStart = static_cast<ALuint>(values[0]);
+            albuf->mLoopEnd = static_cast<ALuint>(values[1]);
         }
         break;
 
@@ -1253,13 +1344,13 @@ START_API_FUNC
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alGetBufferf(ALuint buffer, ALenum param, ALfloat *value)
+AL_API void AL_APIENTRY alGetBufferf(ALuint buffer, ALenum param, ALfloat *value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -1281,7 +1372,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
@@ -1309,7 +1400,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
@@ -1325,13 +1416,13 @@ START_API_FUNC
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alGetBufferi(ALuint buffer, ALenum param, ALint *value)
+AL_API void AL_APIENTRY alGetBufferi(ALuint buffer, ALenum param, ALint *value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
     ALbuffer *albuf = LookupBuffer(device, buffer);
     if UNLIKELY(!albuf)
@@ -1341,7 +1432,7 @@ START_API_FUNC
     else switch(param)
     {
     case AL_FREQUENCY:
-        *value = static_cast<ALint>(albuf->Frequency);
+        *value = static_cast<ALint>(albuf->mSampleRate);
         break;
 
     case AL_BITS:
@@ -1353,7 +1444,7 @@ START_API_FUNC
         break;
 
     case AL_SIZE:
-        *value = static_cast<ALint>(albuf->SampleLen * albuf->frameSizeFromFmt());
+        *value = static_cast<ALint>(albuf->mSampleLen * albuf->frameSizeFromFmt());
         break;
 
     case AL_UNPACK_BLOCK_ALIGNMENT_SOFT:
@@ -1365,11 +1456,15 @@ START_API_FUNC
         break;
 
     case AL_AMBISONIC_LAYOUT_SOFT:
-        *value = albuf->AmbiLayout;
+        *value = EnumFromAmbiLayout(albuf->mAmbiLayout);
         break;
 
     case AL_AMBISONIC_SCALING_SOFT:
-        *value = albuf->AmbiScaling;
+        *value = EnumFromAmbiScaling(albuf->mAmbiScaling);
+        break;
+
+    case AL_UNPACK_AMBISONIC_ORDER_SOFT:
+        *value = static_cast<int>(albuf->UnpackAmbiOrder);
         break;
 
     default:
@@ -1384,7 +1479,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
         context->setError(AL_INVALID_NAME, "Invalid buffer ID %u", buffer);
@@ -1414,6 +1509,7 @@ START_API_FUNC
     case AL_PACK_BLOCK_ALIGNMENT_SOFT:
     case AL_AMBISONIC_LAYOUT_SOFT:
     case AL_AMBISONIC_SCALING_SOFT:
+    case AL_UNPACK_AMBISONIC_ORDER_SOFT:
         alGetBufferi(buffer, param, values);
         return;
     }
@@ -1421,7 +1517,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
     ALbuffer *albuf = LookupBuffer(device, buffer);
     if UNLIKELY(!albuf)
@@ -1431,8 +1527,8 @@ START_API_FUNC
     else switch(param)
     {
     case AL_LOOP_POINTS_SOFT:
-        values[0] = static_cast<ALint>(albuf->LoopStart);
-        values[1] = static_cast<ALint>(albuf->LoopEnd);
+        values[0] = static_cast<ALint>(albuf->mLoopStart);
+        values[1] = static_cast<ALint>(albuf->mLoopEnd);
         break;
 
     default:
@@ -1449,7 +1545,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
 
     ALbuffer *albuf = LookupBuffer(device, buffer);
@@ -1479,7 +1575,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
     ALbuffer *albuf = LookupBuffer(device, buffer);
     if UNLIKELY(!albuf)
@@ -1489,10 +1585,10 @@ START_API_FUNC
     else switch(param)
     {
     case AL_BUFFER_CALLBACK_FUNCTION_SOFT:
-        *value = reinterpret_cast<void*>(albuf->Callback);
+        *value = reinterpret_cast<void*>(albuf->mCallback);
         break;
     case AL_BUFFER_CALLBACK_USER_PARAM_SOFT:
-        *value = albuf->UserData;
+        *value = albuf->mUserData;
         break;
 
     default:
@@ -1507,7 +1603,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
         context->setError(AL_INVALID_NAME, "Invalid buffer ID %u", buffer);
@@ -1535,7 +1631,7 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    ALCdevice *device{context->mDevice.get()};
+    ALCdevice *device{context->mALDevice.get()};
     std::lock_guard<std::mutex> _{device->BufferLock};
     if UNLIKELY(LookupBuffer(device, buffer) == nullptr)
         context->setError(AL_INVALID_NAME, "Invalid buffer ID %u", buffer);
@@ -1550,43 +1646,12 @@ START_API_FUNC
 END_API_FUNC
 
 
-ALuint BytesFromFmt(FmtType type) noexcept
-{
-    switch(type)
-    {
-    case FmtUByte: return sizeof(ALubyte);
-    case FmtShort: return sizeof(ALshort);
-    case FmtFloat: return sizeof(ALfloat);
-    case FmtDouble: return sizeof(ALdouble);
-    case FmtMulaw: return sizeof(ALubyte);
-    case FmtAlaw: return sizeof(ALubyte);
-    }
-    return 0;
-}
-ALuint ChannelsFromFmt(FmtChannels chans) noexcept
-{
-    switch(chans)
-    {
-    case FmtMono: return 1;
-    case FmtStereo: return 2;
-    case FmtRear: return 2;
-    case FmtQuad: return 4;
-    case FmtX51: return 6;
-    case FmtX61: return 7;
-    case FmtX71: return 8;
-    case FmtBFormat2D: return 3;
-    case FmtBFormat3D: return 4;
-    }
-    return 0;
-}
-
-
 BufferSubList::~BufferSubList()
 {
     uint64_t usemask{~FreeMask};
     while(usemask)
     {
-        ALsizei idx{CTZ64(usemask)};
+        const int idx{al::countr_zero(usemask)};
         al::destroy_at(Buffers+idx);
         usemask &= ~(1_u64 << idx);
     }
